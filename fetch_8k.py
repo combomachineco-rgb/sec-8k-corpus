@@ -261,7 +261,9 @@ def main() -> int:
         nonlocal last_commit
         append(p_rows, p_done, p_fail)
         p_rows.clear(); p_done.clear(); p_fail.clear()
-        if args.branch and (final or time.monotonic() - last_commit > args.commit_every_min * 60):
+        # First commit early (proof the run works lands within minutes), then every commit_every_min.
+        every = 3.0 if last_commit == t0 else args.commit_every_min
+        if args.branch and (final or time.monotonic() - last_commit > every * 60):
             git_commit_push(args.branch, f"shard {args.shard}/{args.of}: +{n} filings {dict(stats)}")
             last_commit = time.monotonic()
 
@@ -285,6 +287,11 @@ def main() -> int:
                 month, rows, fail = f.result()
                 if fail:
                     p_fail[month].append(fail); stats["failed"] += 1
+                    if n < 50 and stats["failed"] == n + 1 and n + 1 >= 20:
+                        # FAIL FAST: the first 20 filings all failed -> something
+                        # systematic (URL, network, parser), not per-filing noise.
+                        print(f"ABORT: first {n+1} filings all failed; last error: {fail['error']}", flush=True)
+                        flush(final=True); sys.exit(2)
                 else:
                     p_rows[rows[0]["filing_date"]].extend(rows)
                     p_done[month].append(acc)
