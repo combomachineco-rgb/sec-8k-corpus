@@ -70,7 +70,7 @@ def sec_get(url: str, tries: int = 6) -> requests.Response:
         if wait > 0:
             time.sleep(wait)
         try:
-            r = _session.get(url, timeout=120)
+            r = _session.get(url, timeout=300)
         except requests.RequestException:
             if attempt == tries - 1:
                 raise
@@ -152,7 +152,18 @@ def parse_submission(sub: str) -> tuple[dict, list[dict], list[dict]]:
 
 
 def fetch_filing(acc: str, meta: list) -> tuple[str, list[dict], dict | None]:
-    """-> (month, rows, failure)."""
+    """-> (month, rows, failure). Never raises: a bug on one filing is a
+    recorded failure for that filing, not the end of the shard."""
+    try:
+        return _fetch_filing(acc, meta)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        return meta[3][:7], [], {"accession": acc, "cik": meta[0], "filing_date": meta[3],
+                                 "error": f"worker: {type(exc).__name__}: {exc}"[:200],
+                                 "trace": traceback.format_exc()[-600:]}
+
+
+def _fetch_filing(acc: str, meta: list) -> tuple[str, list[dict], dict | None]:
     cik, primary, items, fdate = meta
     url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{acc}.txt"
     base = {"accession": acc, "cik": cik, "filing_date": fdate, "primary_document": primary,
@@ -173,8 +184,28 @@ def fetch_filing(acc: str, meta: list) -> tuple[str, list[dict], dict | None]:
 
 
 # ------------------------------------------------------------------ storage
+RUN_TOKEN = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+PART_ROLL_BYTES = 50_000_000     # GitHub rejects files > 100 MB; roll well before
+_epoch = 1                       # bumped at every commit: a file is NEVER written to after it is committed
+_part_no: dict[str, int] = {}
+
+
 def day_path(date: str) -> Path:
-    return OUT / date[:4] / f"{date}.jsonl.gz"
+    """This process's current part file for a filing day.
+
+    A data file is written between two commits and never touched again:
+    the name carries the process token and the commit epoch. This matters
+    because the runner's sparse checkout excludes data/**/*.jsonl.gz, so a
+    `git pull --rebase` may drop an already-committed file from the working
+    tree -- appending to it afterwards would silently replace its contents
+    on the next commit. Parts also roll at PART_ROLL_BYTES so no file
+    approaches GitHub's 100 MB limit."""
+    n = _part_no.get(date, 1)
+    p = OUT / date[:4] / f"{date}.{RUN_TOKEN}.e{_epoch}.p{n}.jsonl.gz"
+    if p.exists() and p.stat().st_size > PART_ROLL_BYTES:
+        _part_no[date] = n + 1
+        p = OUT / date[:4] / f"{date}.{RUN_TOKEN}.e{_epoch}.p{n + 1}.jsonl.gz"
+    return p
 
 
 def done_path(month: str) -> Path:
@@ -213,18 +244,26 @@ def append(pending_rows: dict[str, list[dict]], pending_done: dict[str, list[str
 
 
 def git_commit_push(branch: str, msg: str) -> None:
+    global _epoch
+    _epoch += 1                  # every file written from now on has a new name
+    _part_no.clear()
     def run(*a):
         return subprocess.run(["git", *a], cwd=ROOT, capture_output=True, text=True)
-    run("add", "-A", str(OUT))
+    # --sparse: the runner's checkout excludes data/**/*.jsonl.gz (so it never
+    # materialises other shards' gigabytes); new files there still need adding.
+    run("add", "--sparse", "-A", str(OUT))
     if run("diff", "--cached", "--quiet").returncode == 0:
         return
     run("commit", "-q", "-m", msg)
-    for i in range(8):
+    for i in range(20):
         if run("push", "origin", f"HEAD:{branch}").returncode == 0:
             return
-        run("pull", "--rebase", "--autostash", "origin", branch)
-        time.sleep(5 * (i + 1))
-    print("push failed after retries", flush=True)
+        r = run("pull", "--rebase", "--autostash", "origin", branch)
+        if r.returncode != 0:
+            run("rebase", "--abort")
+        time.sleep(min(10 * (i + 1), 120))
+    print("FATAL: push failed after 20 retries; last: " + run("push", "origin", f"HEAD:{branch}").stderr[-400:], flush=True)
+    sys.exit(4)
 
 
 # ------------------------------------------------------------------ main

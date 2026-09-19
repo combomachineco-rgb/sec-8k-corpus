@@ -1,8 +1,15 @@
 name: fetch
 # Downloads every 8-K in filings_index.json.gz (281,935 filings, 2022-07-18 .. 2026-08-07)
-# as EDGAR complete submission files and commits every text document to data/. Each shard
-# owns a round-robin set of months, so parallel jobs never touch the same file. Re-running
-# resumes: finished filings are skipped, failed ones retried. Each job commits every ~20 min.
+# as EDGAR complete submission files and commits every text document to data/.
+#
+# Self-completing: each shard owns a round-robin set of months (no shared files), commits
+# every ~20 minutes, skips finished filings and retries failed ones on re-run. The final
+# `chain` job re-dispatches this workflow while filings remain (bounded by max_rounds, and
+# it stops if a round made no progress). data/STATUS.json records each round's totals.
+#
+# Runners check out a PARTIAL clone (no data/**/*.jsonl.gz blobs) so a runner never holds
+# other shards' gigabytes; the fetcher adds its new files with `git add --sparse` and never
+# writes to a file after committing it (a rebase can drop such files from the worktree).
 on:
   workflow_dispatch:
     inputs:
@@ -12,11 +19,23 @@ on:
       budget_min:
         description: "minutes each job fetches before it stops and commits"
         default: "330"
+      round:
+        description: "round number (set by the chain job)"
+        default: "1"
+      max_rounds:
+        description: "stop chaining after this many rounds"
+        default: "8"
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: fetch
   cancel-in-progress: false
+env:
+  SHARDS: ${{ github.event.inputs.shards || '4' }}
+  BUDGET: ${{ github.event.inputs.budget_min || '330' }}
+  ROUND: ${{ github.event.inputs.round || '1' }}
+  MAX_ROUNDS: ${{ github.event.inputs.max_rounds || '8' }}
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -24,7 +43,7 @@ jobs:
       matrix: ${{ steps.m.outputs.matrix }}
     steps:
       - id: m
-        run: echo "matrix=$(python3 -c "import json;print(json.dumps(list(range(int('${{ github.event.inputs.shards || '4' }}')))))")" >> "$GITHUB_OUTPUT"
+        run: echo "matrix=$(python3 -c "import json;print(json.dumps(list(range(int('$SHARDS')))))")" >> "$GITHUB_OUTPUT"
   fetch:
     needs: plan
     runs-on: ubuntu-latest
@@ -36,7 +55,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/data/**/*.jsonl.gz
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -45,5 +68,35 @@ jobs:
           git config user.name "sec-8k-fetcher"
           git config user.email "systain11@gmail.com"
       - run: |
-          python fetch_8k.py --shard ${{ matrix.shard }} --of ${{ github.event.inputs.shards || '4' }} \
-            --budget-min ${{ github.event.inputs.budget_min || '330' }} --branch ${{ github.ref_name }}
+          python fetch_8k.py --shard ${{ matrix.shard }} --of "$SHARDS" \
+            --budget-min "$BUDGET" --branch ${{ github.ref_name }}
+      - if: always()
+        run: df -h / | tail -1; du -sh .git data 2>/dev/null || true
+  chain:
+    needs: fetch
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/data/**/*.jsonl.gz
+          sparse-checkout-cone-mode: false
+      - run: |
+          git config user.name "sec-8k-fetcher"
+          git config user.email "systain11@gmail.com"
+          git pull -q --rebase origin ${{ github.ref_name }}
+      - id: status
+        run: python chain.py --round "$ROUND" --max-rounds "$MAX_ROUNDS" --fetch-result "${{ needs.fetch.result }}"
+      - run: |
+          git add data/STATUS.json
+          git commit -q -m "status: round $ROUND $(python3 -c "import json;d=json.load(open('data/STATUS.json'));print(f\"done={d['done']} remaining={d['remaining']} next={d['next_round']}\")")" || true
+          for i in 1 2 3 4 5; do git push origin HEAD:${{ github.ref_name }} && break; git pull -q --rebase origin ${{ github.ref_name }}; sleep 10; done
+      - if: steps.status.outputs.next == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run fetch.yml --ref ${{ github.ref_name }} \
+            -f shards="$SHARDS" -f budget_min="$BUDGET" -f round="$((ROUND + 1))" -f max_rounds="$MAX_ROUNDS"
