@@ -1,134 +1,109 @@
 name: hetzner
-# Operates the owner's Hetzner box from a GitHub-hosted runner over SSH, so a Claude session
-# (or the owner, from the GitHub phone app) can run work there without a terminal.
+# Operates the project's Hetzner box from a GitHub-hosted runner (API + SSH), so a Claude
+# session or the owner (GitHub phone app) can run work there without a terminal.
 #
-# ISOLATION CONTRACT: everything this workflow ever creates on the box lives under
-# /srv/sec-8k, owned by a dedicated user `sec8k`. It never touches other directories,
-# users, services, containers, cron, or firewall rules. `probe` is read-only.
+# The project box is a DEDICATED server named `sec-8k` (created by task=create). Nothing here
+# ever targets any other server unless `server` is set explicitly; the production box
+# `tradeinteldesk` is never touched by default. On the box everything lives in
+# /srv/sec-8k-corpus (the corpus clone); no extra nesting, no extra users, no services.
 on:
   workflow_dispatch:
     inputs:
       task:
-        description: "prices (read-only) | probe (read-only inventory) | setup (create /srv/sec-8k + user + clone corpus) | run (a command inside /srv/sec-8k as sec8k)"
+        description: "prices | create (new cx33 server `sec-8k`, boot script clones corpus + installs Claude Code) | probe (read-only inventory) | run (shell command on the box, cwd /srv/sec-8k-corpus)"
         default: "probe"
       server:
-        description: "server name in the Hetzner project (blank = the only server, or the first one)"
-        default: ""
+        description: "server name to target (default sec-8k; never the production box unless named here)"
+        default: "sec-8k"
       cmd:
-        description: "for task=run: the shell command, executed as sec8k with cwd /srv/sec-8k"
+        description: "for task=run: the shell command"
         default: ""
 jobs:
   hetzner:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      TASK: ${{ github.event.inputs.task || 'probe' }}
+      WANT: ${{ github.event.inputs.server || 'sec-8k' }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            /*
-            !/data/**/*.jsonl.gz
-          sparse-checkout-cone-mode: false
-          filter: blob:none
-      - name: Check secrets exist
+      - name: Secrets present
         env:
-          T: ${{ secrets.HCLOUD_TOKEN }}
           K: ${{ secrets.HETZNER_SSH_KEY }}
           U: ${{ secrets.HETZNER_USER }}
         run: |
-          [ -n "$T" ] && echo "HCLOUD_TOKEN set" || { echo "HCLOUD_TOKEN missing"; exit 1; }
-          [ -n "$K" ] && echo "HETZNER_SSH_KEY set (${#K} chars)" || { echo "HETZNER_SSH_KEY missing"; exit 1; }
-          [ -n "$U" ] && echo "HETZNER_USER set" || { echo "HETZNER_USER missing"; exit 1; }
-      - name: Find server via Hetzner API
+          [ -n "$HCLOUD_TOKEN" ] || { echo "HCLOUD_TOKEN missing"; exit 1; }
+          [ -n "$K" ] || { echo "HETZNER_SSH_KEY missing"; exit 1; }
+          [ -n "$U" ] || { echo "HETZNER_USER missing"; exit 1; }
+          mkdir -p ~/.ssh && printf '%s\n' "$K" > ~/.ssh/hz && chmod 600 ~/.ssh/hz && ssh-keygen -y -f ~/.ssh/hz >/dev/null && echo "ssh key parses OK"
+      - name: "Prices (read-only)"
+        if: env.TASK == 'prices'
+        run: |
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/server_types?per_page=50" | jq -r '.server_types[] | select(.deprecated==false) | select(.name|test("^(cx|cpx|cax)")) | . as $t | ((.prices[] | select(.location=="hel1")) // .prices[0]) as $p | "  \($t.name)\t\($t.cores) vcpu\t\($t.memory) GB\t\($t.disk) GB\t\($p.price_monthly.gross | tonumber | . * 100 | round / 100) EUR/mo"' | sort -t$'\t' -k5 -n
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/pricing | jq -r '.pricing.volume | "  volume: \(.price_per_gb_month.gross | tonumber | . * 1000 | round / 1000) EUR/GB/mo"'
+      - name: "Create server sec-8k (cx33, hel1, ubuntu-24.04) with boot script"
+        if: env.TASK == 'create'
+        run: |
+          if curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/servers?name=$WANT" | jq -e '.servers|length>0' >/dev/null; then
+            echo "server $WANT already exists; not creating a second one"; exit 0; fi
+          cat > user_data.yaml <<'CLOUD'
+          #cloud-config
+          package_update: true
+          packages: [git, python3, python3-pip, jq, sqlite3, screen]
+          runcmd:
+            - [bash, -lc, "cd /srv && git clone --depth 1 https://github.com/combomachineco-rgb/sec-8k-corpus.git sec-8k-corpus 2>&1 | tail -2"]
+            - [bash, -lc, "cd /srv/sec-8k-corpus && python3 - > SETUP.txt 2>&1 <<'PY'\nimport glob,gzip,json\nn=0;f=set()\nfor p in glob.glob('data/*/*.jsonl.gz'):\n    for l in gzip.open(p,'rt',encoding='utf-8'):\n        n+=1; f.add(json.loads(l)['accession'])\nprint(f'document rows={n} filings={len(f)}')\nPY"]
+            - [bash, -lc, "curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 && echo 'claude installed' >> /srv/sec-8k-corpus/SETUP.txt || echo 'claude install failed' >> /srv/sec-8k-corpus/SETUP.txt"]
+            - [bash, -lc, "echo BOOT_SETUP_DONE $(date -u +%FT%TZ) >> /srv/sec-8k-corpus/SETUP.txt"]
+          CLOUD
+          jq -n --arg name "$WANT" --rawfile ud user_data.yaml '{name:$name, server_type:"cx33", image:"ubuntu-24.04", location:"hel1", ssh_keys:["arca-server-key"], user_data:$ud, labels:{project:"sec-8k-corpus"}}' > create.json
+          curl -fsS -X POST -H "Authorization: Bearer $HCLOUD_TOKEN" -H "Content-Type: application/json" -d @create.json https://api.hetzner.cloud/v1/servers > created.json
+          jq -r '"created: \(.server.name) id=\(.server.id) ip=\(.server.public_net.ipv4.ip) type=\(.server.server_type.name) status=\(.server.status)"' created.json
+      - name: Resolve server IP
         id: srv
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          WANT: ${{ github.event.inputs.server }}
         run: |
-          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/servers > servers.json
-          echo "servers in project:"; jq -r '.servers[] | "  \(.name)  \(.public_net.ipv4.ip)  \(.server_type.name)  \(.status)  \(.datacenter.location.name)"' servers.json
-          if [ -n "$WANT" ]; then ip=$(jq -r --arg n "$WANT" '.servers[] | select(.name==$n) | .public_net.ipv4.ip' servers.json); name="$WANT"
-          else ip=$(jq -r '.servers[0].public_net.ipv4.ip' servers.json); name=$(jq -r '.servers[0].name' servers.json); fi
-          [ -n "$ip" ] && [ "$ip" != "null" ] || { echo "server not found"; exit 1; }
-          echo "using: $name ($ip)"; echo "ip=$ip" >> "$GITHUB_OUTPUT"; echo "name=$name" >> "$GITHUB_OUTPUT"
-      - name: "Prices (read-only, from the API)"
-        if: github.event.inputs.task == 'prices'
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-        run: |
-          loc=$(jq -r '.servers[0].datacenter.location.name // "hel1"' servers.json); echo "existing server location: $loc"
-          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/server_types?per_page=50" > st.json
-          echo "== server types (monthly gross EUR, at $loc if offered, else first location)"
-          jq -r --arg loc "$loc" '.server_types[] | select(.deprecated==false) | select(.name|test("^(cx|cpx|cax)")) | . as $t | ((.prices[] | select(.location==$loc)) // .prices[0]) as $p | "  \($t.name)\t\($t.cores) vcpu\t\($t.memory) GB\t\($t.disk) GB\t\($t.architecture)\t\($p.price_monthly.gross | tonumber | . * 100 | round / 100) EUR/mo @\($p.location)"' st.json | sort -t$'\t' -k6 -n
-          echo "== volume price"
-          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/pricing | jq -r '.pricing.volume | "  \(.price_per_gb_month.gross | tonumber | . * 1000 | round / 1000) EUR per GB per month gross  ->  50 GB = \((.price_per_gb_month.gross|tonumber)*50*100|round/100) EUR/mo, 100 GB = \((.price_per_gb_month.gross|tonumber)*100*100|round/100) EUR/mo"'
-          echo "== current server"; jq -r '.servers[0] | "  \(.name): \(.server_type.name) \(.server_type.cores) vcpu \(.server_type.memory) GB ram \(.server_type.disk) GB disk"' servers.json
-      - name: "Network check (read-only): firewalls and reachable ports"
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          IP: ${{ steps.srv.outputs.ip }}
-        run: |
-          echo "== server's attached firewalls (from API)"
-          jq -r '.servers[0] | "  firewalls on server: \(.public_net.firewalls | length)"' servers.json
-          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/firewalls | jq -r '.firewalls[] | "  fw \(.name): " , (.rules[] | "     \(.direction) \(.protocol) port=\(.port // "-") from=\(.source_ips // [] | join(","))")'
-          echo "== TCP reachability from this runner"
-          for port in 22 2222 222 2200; do timeout 5 bash -c "</dev/tcp/$IP/$port" 2>/dev/null && echo "  port $port: OPEN" || echo "  port $port: closed/filtered"; done
-          echo "== this runner's egress IP: $(curl -fsS https://api.ipify.org)"
-      - name: SSH key
-        env:
-          K: ${{ secrets.HETZNER_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh && printf '%s\n' "$K" > ~/.ssh/hz && chmod 600 ~/.ssh/hz
-          ssh-keygen -y -f ~/.ssh/hz > /dev/null && echo "key parses OK" || { echo "key does not parse (passphrase? wrong format?)"; exit 1; }
-      - name: "Probe (read-only)"
-        if: github.event.inputs.task == 'probe'
+          for i in $(seq 1 30); do
+            curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/servers?name=$WANT" > servers.json
+            ip=$(jq -r '.servers[0].public_net.ipv4.ip // empty' servers.json); st=$(jq -r '.servers[0].status // empty' servers.json)
+            [ -n "$ip" ] && [ "$st" = "running" ] && break; echo "waiting for $WANT (status=$st)"; sleep 10; done
+          [ -n "$ip" ] || { echo "server $WANT not found"; exit 1; }
+          echo "target: $WANT ($ip) status=$st"; echo "ip=$ip" >> "$GITHUB_OUTPUT"
+      - name: Wait for SSH
         env:
           U: ${{ secrets.HETZNER_USER }}
           IP: ${{ steps.srv.outputs.ip }}
         run: |
-          ssh -i ~/.ssh/hz -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "$U@$IP" bash -s <<'REMOTE'
-          set +e
-          echo "== host"; hostname; uname -r; cat /etc/os-release | grep PRETTY; echo "cpus=$(nproc) mem=$(free -h | awk '/Mem/{print $2}') disk_free=$(df -h / | awk 'NR==2{print $4}')"
-          echo "== who am i"; id
-          echo "== top-level dirs"; ls -la / | awk '{print $1, $3, $NF}' | grep -vE ' (\.|\.\.|proc|sys|dev|run|boot|lib.*|bin|sbin|usr|etc|var|tmp|mnt|media|snap|lost\+found)$'
-          echo "== /srv /opt /home"; ls -la /srv /opt /home 2>/dev/null
-          echo "== /srv/sec-8k exists?"; [ -d /srv/sec-8k ] && ls -la /srv/sec-8k || echo "no (good, clean slate)"
-          echo "== user sec8k exists?"; id sec8k 2>/dev/null || echo "no"
-          echo "== tools"; for t in git python3 pip3 curl node npm docker claude; do printf '%-8s ' $t; command -v $t >/dev/null && $t --version 2>&1 | head -1 || echo "absent"; done
-          echo "== running services (user-facing)"; systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}' | grep -vE '^(ssh|systemd|dbus|cron|rsyslog|getty|polkit|networkd|resolved|journald|udev|snap|unattended|qemu|chrony|ntp|multipath|lvm|apparmor|ModemManager|serial)' | head -30
-          echo "== docker containers"; docker ps --format '{{.Names}}  {{.Image}}  {{.Status}}' 2>/dev/null || echo "docker not running / not installed"
-          echo "== listening ports"; ss -tlnp 2>/dev/null | awk 'NR>1{print $4, $6}' | head -20
-          REMOTE
-      - name: "Setup (isolated: /srv/sec-8k, user sec8k)"
-        if: github.event.inputs.task == 'setup'
+          for i in $(seq 1 40); do ssh -i ~/.ssh/hz -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$U@$IP" true 2>/dev/null && { echo "ssh OK"; exit 0; }; sleep 10; done
+          echo "ssh not reachable"; exit 1
+      - name: "After create: wait for the boot script, then verify"
+        if: env.TASK == 'create'
         env:
           U: ${{ secrets.HETZNER_USER }}
           IP: ${{ steps.srv.outputs.ip }}
         run: |
           ssh -i ~/.ssh/hz -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$U@$IP" bash -s <<'REMOTE'
-          set -e
-          export DEBIAN_FRONTEND=noninteractive
-          for t in git python3 curl; do command -v $t >/dev/null || { apt-get update -qq && apt-get install -y -qq git python3 python3-pip curl; break; }; done
-          id sec8k >/dev/null 2>&1 || useradd -m -s /bin/bash sec8k
-          mkdir -p /srv/sec-8k && chown sec8k:sec8k /srv/sec-8k
-          sudo -u sec8k bash -lc '
-            set -e; cd /srv/sec-8k
-            if [ -d corpus/.git ]; then git -C corpus pull -q --ff-only; else git clone -q --depth 1 https://github.com/combomachineco-rgb/sec-8k-corpus corpus; fi
-            echo "corpus files: $(ls corpus/data/*/*.jsonl.gz | wc -l)  size: $(du -sh corpus/data | cut -f1)"
-            python3 - <<PY
-          import glob,gzip,json
-          n=0;f=set()
-          for p in glob.glob("corpus/data/*/*.jsonl.gz"):
-              for l in gzip.open(p,"rt",encoding="utf-8"):
-                  n+=1; f.add(json.loads(l)["accession"])
-          print(f"document rows={n} filings={len(f)}")
-          PY
-            command -v ~/.local/bin/claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || echo "claude install skipped"
-            ~/.local/bin/claude --version 2>/dev/null || echo "claude not on path yet"
-          '
-          echo "== isolation check: everything under /srv/sec-8k owned by sec8k"; ls -la /srv/sec-8k; du -sh /srv/sec-8k
+          for i in $(seq 1 90); do grep -q BOOT_SETUP_DONE /srv/sec-8k-corpus/SETUP.txt 2>/dev/null && break; sleep 20; done
+          echo "== SETUP.txt"; cat /srv/sec-8k-corpus/SETUP.txt 2>/dev/null || { echo "boot script not finished; cloud-init tail:"; tail -30 /var/log/cloud-init-output.log; }
+          echo "== disk"; df -h / | tail -1; du -sh /srv/sec-8k-corpus 2>/dev/null
+          echo "== tools"; git --version; python3 --version; ls -la ~/.local/bin/claude 2>/dev/null || echo "claude binary not found"
+          echo "== sshd password auth"; sshd -T 2>/dev/null | grep -E '^passwordauthentication' || grep -i '^PasswordAuthentication' /etc/ssh/sshd_config
           REMOTE
-      - name: "Run (as sec8k, cwd /srv/sec-8k)"
-        if: github.event.inputs.task == 'run'
+      - name: "Probe (read-only)"
+        if: env.TASK == 'probe'
+        env:
+          U: ${{ secrets.HETZNER_USER }}
+          IP: ${{ steps.srv.outputs.ip }}
+        run: |
+          ssh -i ~/.ssh/hz -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$U@$IP" bash -s <<'REMOTE'
+          set +e
+          echo "== host"; hostname; grep PRETTY /etc/os-release; echo "cpus=$(nproc) mem=$(free -h | awk '/Mem/{print $2}') disk_free=$(df -h / | awk 'NR==2{print $4}')"
+          echo "== /srv"; ls -la /srv; [ -f /srv/sec-8k-corpus/SETUP.txt ] && cat /srv/sec-8k-corpus/SETUP.txt
+          echo "== tools"; for t in git python3 sqlite3 claude ~/.local/bin/claude; do printf '%-22s ' $t; command -v $t >/dev/null && $t --version 2>&1 | head -1 || echo absent; done
+          echo "== services"; systemctl list-units --type=service --state=running --no-pager --no-legend | awk '{print $1}' | grep -vE '^(ssh|systemd|dbus|cron|rsyslog|getty|polkit|networkd|resolved|journald|udev|snap|unattended|qemu|chrony|ntp|multipath|lvm|apparmor|ModemManager|serial|cloud|user@)' | head
+          echo "== ports"; ss -tlnp | awk 'NR>1{print $4}' | sort -u
+          REMOTE
+      - name: "Run command (cwd /srv/sec-8k-corpus)"
+        if: env.TASK == 'run'
         env:
           U: ${{ secrets.HETZNER_USER }}
           IP: ${{ steps.srv.outputs.ip }}
@@ -136,4 +111,4 @@ jobs:
         run: |
           [ -n "$CMD" ] || { echo "cmd input is empty"; exit 1; }
           printf '%s' "$CMD" | base64 -w0 > cmd.b64
-          ssh -i ~/.ssh/hz -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$U@$IP" "sudo -u sec8k bash -lc 'cd /srv/sec-8k && bash -c \"\$(echo $(cat cmd.b64) | base64 -d)\"'"
+          ssh -i ~/.ssh/hz -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$U@$IP" "cd /srv/sec-8k-corpus && bash -c \"\$(echo $(cat cmd.b64) | base64 -d)\""
