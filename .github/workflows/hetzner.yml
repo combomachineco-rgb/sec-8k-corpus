@@ -35,7 +35,6 @@ jobs:
           K: ${{ secrets.HETZNER_SSH_KEY }}
           U: ${{ secrets.HETZNER_USER }}
         run: |
-          for v in T K U; do [ -n "${!v}" ] && echo "$v: set (${#v} chars name, value length ${#!v} hidden)" || { echo "$v: MISSING"; exit 1; }; done 2>/dev/null || true
           [ -n "$T" ] && echo "HCLOUD_TOKEN set" || { echo "HCLOUD_TOKEN missing"; exit 1; }
           [ -n "$K" ] && echo "HETZNER_SSH_KEY set (${#K} chars)" || { echo "HETZNER_SSH_KEY missing"; exit 1; }
           [ -n "$U" ] && echo "HETZNER_USER set" || { echo "HETZNER_USER missing"; exit 1; }
