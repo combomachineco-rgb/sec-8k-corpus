@@ -50,6 +50,17 @@ jobs:
           else ip=$(jq -r '.servers[0].public_net.ipv4.ip' servers.json); name=$(jq -r '.servers[0].name' servers.json); fi
           [ -n "$ip" ] && [ "$ip" != "null" ] || { echo "server not found"; exit 1; }
           echo "using: $name ($ip)"; echo "ip=$ip" >> "$GITHUB_OUTPUT"; echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: "Network check (read-only): firewalls and reachable ports"
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          IP: ${{ steps.srv.outputs.ip }}
+        run: |
+          echo "== server's attached firewalls (from API)"
+          jq -r '.servers[0] | "  firewalls on server: \(.public_net.firewalls | length)"' servers.json
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/firewalls | jq -r '.firewalls[] | "  fw \(.name): " , (.rules[] | "     \(.direction) \(.protocol) port=\(.port // "-") from=\(.source_ips // [] | join(","))")'
+          echo "== TCP reachability from this runner"
+          for port in 22 2222 222 2200; do timeout 5 bash -c "</dev/tcp/$IP/$port" 2>/dev/null && echo "  port $port: OPEN" || echo "  port $port: closed/filtered"; done
+          echo "== this runner's egress IP: $(curl -fsS https://api.ipify.org)"
       - name: SSH key
         env:
           K: ${{ secrets.HETZNER_SSH_KEY }}
