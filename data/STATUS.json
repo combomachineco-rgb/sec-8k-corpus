@@ -1,19 +1,24 @@
 {
-  "round": 1,
+  "round": 2,
   "fetch_job_result": "cancelled",
   "total": 281935,
-  "done": 265482,
-  "remaining": 16453,
-  "progress_this_round": 265482,
+  "done": 271684,
+  "remaining": 10251,
+  "progress_this_round": 6202,
   "failed_rows": 2,
   "next_round": true,
   "stopped_because": null,
-  "updated_utc": "2026-09-19T23:01:49Z",
+  "updated_utc": "2026-09-19T23:58:22Z",
   "history": [
     {
       "round": 1,
       "done": 265482,
       "remaining": 16453
+    },
+    {
+      "round": 2,
+      "done": 271684,
+      "remaining": 10251
     }
   ]
 }
