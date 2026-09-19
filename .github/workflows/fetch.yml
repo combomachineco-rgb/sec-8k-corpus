@@ -1,0 +1,49 @@
+name: fetch
+# Downloads every 8-K in filings_index.json.gz (281,935 filings, 2022-07-18 .. 2026-08-07)
+# as EDGAR complete submission files and commits every text document to data/. Each shard
+# owns a round-robin set of months, so parallel jobs never touch the same file. Re-running
+# resumes: finished filings are skipped, failed ones retried. Each job commits every ~20 min.
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "parallel shards"
+        default: "4"
+      budget_min:
+        description: "minutes each job fetches before it stops and commits"
+        default: "330"
+permissions:
+  contents: write
+concurrency:
+  group: fetch
+  cancel-in-progress: false
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: echo "matrix=$(python3 -c "import json;print(json.dumps(list(range(int('${{ github.event.inputs.shards || '4' }}')))))")" >> "$GITHUB_OUTPUT"
+  fetch:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 356
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q requests
+      - run: |
+          git config user.name "sec-8k-fetcher"
+          git config user.email "systain11@gmail.com"
+      - run: |
+          python fetch_8k.py --shard ${{ matrix.shard }} --of ${{ github.event.inputs.shards || '4' }} \
+            --budget-min ${{ github.event.inputs.budget_min || '330' }} --branch ${{ github.ref_name }}
