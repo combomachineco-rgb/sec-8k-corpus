@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: "probe (read-only inventory) | setup (create /srv/sec-8k + user + clone corpus) | run (a command inside /srv/sec-8k as sec8k)"
+        description: "prices (read-only) | probe (read-only inventory) | setup (create /srv/sec-8k + user + clone corpus) | run (a command inside /srv/sec-8k as sec8k)"
         default: "probe"
       server:
         description: "server name in the Hetzner project (blank = the only server, or the first one)"
@@ -50,6 +50,18 @@ jobs:
           else ip=$(jq -r '.servers[0].public_net.ipv4.ip' servers.json); name=$(jq -r '.servers[0].name' servers.json); fi
           [ -n "$ip" ] && [ "$ip" != "null" ] || { echo "server not found"; exit 1; }
           echo "using: $name ($ip)"; echo "ip=$ip" >> "$GITHUB_OUTPUT"; echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: "Prices (read-only, from the API)"
+        if: github.event.inputs.task == 'prices'
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+        run: |
+          loc=$(jq -r '.servers[0].datacenter.location.name // "hel1"' servers.json); echo "existing server location: $loc"
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/server_types?per_page=50" > st.json
+          echo "== server types (monthly gross EUR, at $loc if offered, else first location)"
+          jq -r --arg loc "$loc" '.server_types[] | select(.deprecated==false) | select(.name|test("^(cx|cpx|cax)")) | . as $t | ((.prices[] | select(.location==$loc)) // .prices[0]) as $p | "  \($t.name)\t\($t.cores) vcpu\t\($t.memory) GB\t\($t.disk) GB\t\($t.architecture)\t\($p.price_monthly.gross | tonumber | . * 100 | round / 100) EUR/mo @\($p.location)"' st.json | sort -t$'\t' -k6 -n
+          echo "== volume price"
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/pricing | jq -r '.pricing.volume | "  \(.price_per_gb_month.gross | tonumber | . * 1000 | round / 1000) EUR per GB per month gross  ->  50 GB = \((.price_per_gb_month.gross|tonumber)*50*100|round/100) EUR/mo, 100 GB = \((.price_per_gb_month.gross|tonumber)*100*100|round/100) EUR/mo"'
+          echo "== current server"; jq -r '.servers[0] | "  \(.name): \(.server_type.name) \(.server_type.cores) vcpu \(.server_type.memory) GB ram \(.server_type.disk) GB disk"' servers.json
       - name: "Network check (read-only): firewalls and reachable ports"
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
