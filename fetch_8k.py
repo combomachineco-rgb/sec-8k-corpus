@@ -141,8 +141,11 @@ def parse_submission(sub: str) -> tuple[dict, list[dict], list[dict]]:
         if not fname.lower().endswith(TEXT_EXT) or dtype.upper() == "GRAPHIC":
             skipped.append(meta)
             continue
-        tm = _TEXT_RE.search(block)
-        body = tm.group(1) if tm else ""
+        # str.find, NOT a regex: '<TEXT>\\s*(.*?)\\s*</TEXT>' is quadratic on long
+        # whitespace runs (measured: 50k spaces = 4 s, 200k = 70 s) and some 2026
+        # filings carry exactly that, which stalled two shards for hours.
+        i = block.find("<TEXT>"); j = block.rfind("</TEXT>")
+        body = block[i + 6:j].strip() if i >= 0 and j > i else ""
         text = html_to_text(body) if fname.lower().endswith((".htm", ".html")) else \
             "\n".join(ln.rstrip() for ln in body.split("\n")).strip()
         docs.append({**meta, "chars": len(text),
