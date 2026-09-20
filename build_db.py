@@ -63,6 +63,12 @@ ITEM_CODES = {
  "Static Pool":"6.06","Alternative Filings of Asset-Backed Issuers":"6.10",
 }
 
+import re as _re
+def _norm(s):
+    return _re.sub(r"[^a-z0-9]", "", s.lower()).replace("modifications", "modification").replace("costs", "cost")
+NORM_CODES = {_norm(k): v for k, v in ITEM_CODES.items()}
+NORM_CODES[_norm("Shareholder Nominations Pursuant to Exchange Act Rule 14a-11")] = "5.08"
+
 def main():
     if TMP.exists(): TMP.unlink()
     db = sqlite3.connect(TMP)
@@ -88,12 +94,18 @@ def main():
                                  json.dumps(r.get("items_index") or []), r.get("primary_document"), r.get("n_docs"),
                                  json.dumps(r.get("docs_skipped") or []), r.get("submission_bytes"), r.get("source_url"),
                                  r.get("fetched_utc"), r.get("fetcher_revision")))
-                    codes = set(r.get("items_index") or [])
+                    # Codes come from the EDGAR submissions index (authoritative). Header names
+                    # are labels: matched by normalized text, else by position when the two
+                    # lists have equal length (they do on every sampled filing), else NULL.
+                    codes = list(r.get("items_index") or [])
+                    by_code = {}
                     for name in declared:
-                        code = ITEM_CODES.get(name); ibuf.append((a, code or "?", name)); ni += 1
-                        if code: codes.discard(code)
-                    for code in sorted(codes):      # in the index but not in the header text
-                        ibuf.append((a, code, None)); ni += 1
+                        c = ITEM_CODES.get(name) or NORM_CODES.get(_norm(name))
+                        if c and c not in by_code: by_code[c] = name
+                    for pos, code in enumerate(codes):
+                        name = by_code.get(code)
+                        if name is None and len(declared) == len(codes): name = declared[pos]
+                        ibuf.append((a, code, name)); ni += 1
                 fn = (r.get("filename") or ""); dt = r.get("doc_type") or ""
                 render = 1 if (dt == "XML" and fn.startswith("R") and fn.endswith(".htm")) else 0
                 dbuf.append((a, r.get("seq"), dt, fn, r.get("description"), render, r.get("chars"), r.get("sha256"), r.get("text")))

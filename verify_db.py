@@ -46,10 +46,12 @@ for sha, text in db.execute("select sha256, text from documents"):
     if hashlib.sha256((text or "").encode("utf-8")).hexdigest() != sha: mism += 1
 check("5 text fidelity (all rows)", mism == 0, f"checked={total} mismatched={mism}")
 
-unk = db.execute("select count(*) from items where item_code='?'").fetchone()[0]
-unk_names = [r[0] for r in db.execute("select distinct item_text from items where item_code='?' limit 10")]
-no_items = db.execute("select count(*) from filings f where items_declared != '[]' and not exists (select 1 from items i where i.accession=f.accession)").fetchone()[0]
-check("6 items mapping", unk == 0 and no_items == 0, f"unmapped={unk} {unk_names} filings_without_items={no_items}")
+n_items = db.execute("select count(*) from items").fetchone()[0]
+n_codes = sum(len(v[2].split(",")) if v[2] else 0 for v in idx.values())
+no_name = db.execute("select count(*) from items where item_text is null").fetchone()[0]
+no_items = db.execute("select count(*) from filings f where items_index != '[]' and not exists (select 1 from items i where i.accession=f.accession)").fetchone()[0]
+bad_code = db.execute("select count(*) from items where item_code not glob '[0-9].[0-9][0-9]'").fetchone()[0]
+check("6 items == index codes", n_items == n_codes and no_items == 0 and bad_code == 0, f"items={n_items} index_codes={n_codes} filings_without_items={no_items} bad_codes={bad_code} unlabeled={no_name} (label gaps are a warning, not a failure)")
 
 bad_dates = sum(1 for a, d in rows.items() if not d or not ("2022-07-18" <= d <= "2026-08-07") or d != idx[a][3])
 check("7 dates", bad_dates == 0, f"bad={bad_dates}")
