@@ -45,7 +45,7 @@ jobs:
         if: env.TASK == 'inventory'
         run: |
           echo "== servers"
-          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/servers?per_page=50" | jq -r '.servers[] | "  \(.name)\t\(.server_type.name)\t\(.datacenter.location.name)\t\(.public_net.ipv4.ip)\t\(.status)\tcreated=\(.created[:10])\tdisk=\(.server_type.disk)GB\tvolumes=\(.volumes|length)\tfirewalls=\([.public_net.firewalls[].id]|length)"'
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/servers?per_page=50" | jq -r '.servers[] | "  \(.name)\t\(.server_type.name)\t\(.datacenter.location.name)\t<ip masked>\t\(.status)\tcreated=\(.created[:10])\tdisk=\(.server_type.disk)GB\tvolumes=\(.volumes|length)\tfirewalls=\([.public_net.firewalls[].id]|length)"'
           echo "== volumes"
           curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/volumes?per_page=50" | jq -r '.volumes[] | "  \(.name)\t\(.size)GB\t\(.location.name)\tserver=\(.server)"'
           echo "== firewalls"
@@ -78,7 +78,7 @@ jobs:
             ip=$(jq -r '.servers[0].public_net.ipv4.ip // empty' servers.json); st=$(jq -r '.servers[0].status // empty' servers.json)
             [ -n "$ip" ] && [ "$st" = "running" ] && break; echo "waiting for $WANT (status=$st)"; sleep 10; done
           [ -n "$ip" ] || { echo "server $WANT not found"; exit 1; }
-          echo "target: $WANT ($ip) status=$st"; echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$ip"; echo "target: $WANT status=$st (ip masked)"; echo "ip=$ip" >> "$GITHUB_OUTPUT"
       - name: Wait for SSH
         env:
           U: ${{ secrets.HETZNER_USER }}
