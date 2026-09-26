@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: "prices | create (new cx33 server `sec-8k`, boot script clones corpus + installs Claude Code) | probe (read-only inventory) | run (shell command on the box, cwd /srv/sec-8k-corpus)"
+        description: "inventory (read-only: every server/volume/firewall in the account) | prices | create (new cx33 server `sec-8k`, boot script clones corpus + installs Claude Code) | probe (read-only inventory) | run (shell command on the box, cwd /srv/sec-8k-corpus)"
         default: "probe"
       server:
         description: "server name to target (default sec-8k; never the production box unless named here)"
@@ -41,6 +41,17 @@ jobs:
         run: |
           curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/server_types?per_page=50" | jq -r '.server_types[] | select(.deprecated==false) | select(.name|test("^(cx|cpx|cax)")) | . as $t | ((.prices[] | select(.location=="hel1")) // .prices[0]) as $p | "  \($t.name)\t\($t.cores) vcpu\t\($t.memory) GB\t\($t.disk) GB\t\($p.price_monthly.gross | tonumber | . * 100 | round / 100) EUR/mo"' | sort -t$'\t' -k5 -n
           curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" https://api.hetzner.cloud/v1/pricing | jq -r '.pricing.volume | "  volume: \(.price_per_gb_month.gross | tonumber | . * 1000 | round / 1000) EUR/GB/mo"'
+      - name: "Account inventory (read-only): every server, volume and firewall"
+        if: env.TASK == 'inventory'
+        run: |
+          echo "== servers"
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/servers?per_page=50" | jq -r '.servers[] | "  \(.name)\t\(.server_type.name)\t\(.datacenter.location.name)\t\(.public_net.ipv4.ip)\t\(.status)\tcreated=\(.created[:10])\tdisk=\(.server_type.disk)GB\tvolumes=\(.volumes|length)\tfirewalls=\([.public_net.firewalls[].id]|length)"'
+          echo "== volumes"
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/volumes?per_page=50" | jq -r '.volumes[] | "  \(.name)\t\(.size)GB\t\(.location.name)\tserver=\(.server)"'
+          echo "== firewalls"
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/firewalls?per_page=50" | jq -r '.firewalls[] | "  \(.name)\tapplied_to=\([.applied_to[].server.id]|length) server(s)\trules=\(.rules|length)"'
+          echo "== ssh keys"
+          curl -fsS -H "Authorization: Bearer $HCLOUD_TOKEN" "https://api.hetzner.cloud/v1/ssh_keys" | jq -r '.ssh_keys[] | "  \(.name)\t\(.fingerprint)"'
       - name: "Create server sec-8k (cx33, hel1, ubuntu-24.04) with boot script"
         if: env.TASK == 'create'
         run: |
